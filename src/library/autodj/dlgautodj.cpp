@@ -1,13 +1,18 @@
 #include "library/autodj/dlgautodj.h"
 
 #include <QKeyEvent>
+#include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
 
 #include "controllers/keyboard/keyboardeventfilter.h"
+#include "library/aidj/rulestrackranker.h"
 #include "library/library.h"
 #include "library/playlisttablemodel.h"
+#include "mixer/playerinfo.h"
 #include "moc_dlgautodj.cpp"
+#include "track/bpm.h"
+#include "track/keyutils.h"
 #include "track/track.h"
 #include "util/assert.h"
 #include "util/duration.h"
@@ -17,6 +22,9 @@
 namespace {
 const char* kPreferenceGroupName = "[Auto DJ]";
 const char* kRepeatPlaylistPreference = "Requeue";
+const char* kEnableSmartQueuePreference = "EnableSmartQueue";
+const char* kSmartQueueMaxBpmDeltaPreference = "SmartQueueMaxBpmDelta";
+const char* kAutoSyncOnTransitionPreference = "AutoSyncOnTransition";
 } // anonymous namespace
 
 DlgAutoDJ::DlgAutoDJ(WLibrary* parent,
@@ -203,6 +211,55 @@ DlgAutoDJ::DlgAutoDJ(WLibrary* parent,
     pushButtonRepeatPlaylist->setChecked(repeatPlaylist);
     slotRepeatPlaylistChanged(repeatPlaylist);
 
+    // AI DJ toggles: Smart Queue (BPM/key-aware selection) and Beatmatch (Sync
+    // on transition). These mirror the corresponding Auto DJ preferences so the
+    // user can flip them without opening the preferences dialog.
+    pushButtonSmartQueue->setText(tr("Smart Queue"));
+    pushButtonAutoSync->setText(tr("Beatmatch"));
+    pushButtonSmartQueue->setToolTip(tr(
+            "Smart Queue\n"
+            "\n"
+            "When adding tracks to the queue, prefer harmonically compatible\n"
+            "keys and close BPM (including half/double tempo) instead of pure\n"
+            "random selection."));
+    pushButtonAutoSync->setToolTip(tr(
+            "Beatmatched Transitions\n"
+            "\n"
+            "Enable Sync on the decks during Auto DJ transitions so tempos\n"
+            "beatmatch automatically."));
+    pushButtonSmartQueue->setChecked(m_pConfig->getValue<bool>(
+            ConfigKey(kPreferenceGroupName, kEnableSmartQueuePreference)));
+    pushButtonAutoSync->setChecked(m_pConfig->getValue<bool>(
+            ConfigKey(kPreferenceGroupName, kAutoSyncOnTransitionPreference)));
+    connect(pushButtonSmartQueue,
+            &QPushButton::clicked,
+            this,
+            &DlgAutoDJ::slotSmartQueueChanged);
+    connect(pushButtonAutoSync,
+            &QPushButton::clicked,
+            this,
+            &DlgAutoDJ::slotAutoSyncChanged);
+
+    labelAiDjTitle->setToolTip(tr("Status of the AI-assisted Auto DJ features."));
+
+    // Refresh the AI DJ status whenever the queue or the playing track changes.
+    connect(m_pAutoDJTableModel,
+            &QAbstractItemModel::modelReset,
+            this,
+            &DlgAutoDJ::updateAiDjStatus);
+    connect(m_pAutoDJTableModel,
+            &QAbstractItemModel::rowsInserted,
+            this,
+            &DlgAutoDJ::updateAiDjStatus);
+    connect(m_pAutoDJTableModel,
+            &QAbstractItemModel::rowsRemoved,
+            this,
+            &DlgAutoDJ::updateAiDjStatus);
+    connect(&PlayerInfo::instance(),
+            &PlayerInfo::currentPlayingTrackChanged,
+            this,
+            &DlgAutoDJ::updateAiDjStatus);
+
     // Setup DlgAutoDJ UI based on the current AutoDJProcessor state. Keep in
     // mind that AutoDJ may already be active when DlgAutoDJ is created (due to
     // skin changes, etc.).
@@ -224,6 +281,7 @@ DlgAutoDJ::DlgAutoDJ(WLibrary* parent,
     autoDJStateChanged(m_pAutoDJProcessor->getState());
 
     updateSelectionInfo();
+    updateAiDjStatus();
 }
 
 DlgAutoDJ::~DlgAutoDJ() {
@@ -352,6 +410,129 @@ void DlgAutoDJ::slotTransitionModeChanged(int newIndex) {
 void DlgAutoDJ::slotRepeatPlaylistChanged(bool checked) {
     m_pConfig->setValue(ConfigKey(kPreferenceGroupName, kRepeatPlaylistPreference),
             checked);
+}
+
+void DlgAutoDJ::slotSmartQueueChanged(bool checked) {
+    m_pConfig->setValue(
+            ConfigKey(kPreferenceGroupName, kEnableSmartQueuePreference), checked);
+    updateAiDjStatus();
+}
+
+void DlgAutoDJ::slotAutoSyncChanged(bool checked) {
+    m_pConfig->setValue(
+            ConfigKey(kPreferenceGroupName, kAutoSyncOnTransitionPreference),
+            checked);
+    updateAiDjStatus();
+}
+
+void DlgAutoDJ::applyAiDjBadge(
+        QLabel* pLabel, const QString& text, const QString& state) {
+    if (text.isEmpty()) {
+        pLabel->clear();
+        pLabel->setVisible(false);
+        return;
+    }
+    // Color palette keyed by semantic state, applied inline so the badges look
+    // consistent regardless of the active skin's stylesheet.
+    QString bg = QStringLiteral("rgba(255,255,255,0.10)");
+    QString fg = QStringLiteral("#c8c8c8");
+    if (state == QLatin1String("good")) {
+        bg = QStringLiteral("rgba(74,181,94,0.22)");
+        fg = QStringLiteral("#6ddd84");
+    } else if (state == QLatin1String("warn")) {
+        bg = QStringLiteral("rgba(230,170,50,0.22)");
+        fg = QStringLiteral("#f0c256");
+    } else if (state == QLatin1String("bad")) {
+        bg = QStringLiteral("rgba(216,80,80,0.22)");
+        fg = QStringLiteral("#f07a7a");
+    }
+    pLabel->setVisible(true);
+    pLabel->setText(text);
+    pLabel->setStyleSheet(QStringLiteral(
+            "padding: 1px 8px; border-radius: 8px; font-weight: 600; "
+            "background-color: %1; color: %2;")
+                                  .arg(bg, fg));
+}
+
+void DlgAutoDJ::updateAiDjStatus() {
+    const bool smartQueue = pushButtonSmartQueue->isChecked();
+    const bool autoSync = pushButtonAutoSync->isChecked();
+
+    // Title acts as a master on/off indicator for the AI DJ features.
+    const bool anyEnabled = smartQueue || autoSync;
+    labelAiDjTitle->setStyleSheet(QStringLiteral(
+            "padding: 1px 8px; border-radius: 8px; font-weight: 700; "
+            "background-color: %1; color: %2;")
+                                          .arg(anyEnabled
+                                                          ? QStringLiteral("rgba(90,140,255,0.25)")
+                                                          : QStringLiteral("rgba(255,255,255,0.08)"),
+                                                  anyEnabled ? QStringLiteral("#8fb0ff")
+                                                             : QStringLiteral("#888888")));
+
+    // Sync status badge.
+    applyAiDjBadge(labelSyncStatus,
+            autoSync ? tr("Beatmatch: On") : tr("Beatmatch: Off"),
+            autoSync ? QStringLiteral("good") : QStringLiteral("muted"));
+
+    // Determine the currently playing track and the next track in the queue to
+    // preview how well they match.
+    TrackPointer pCurrent = PlayerInfo::instance().getCurrentPlayingTrack();
+    TrackPointer pNext;
+    if (m_pAutoDJTableModel && m_pAutoDJTableModel->rowCount() > 0) {
+        pNext = m_pAutoDJTableModel->getTrack(m_pAutoDJTableModel->index(0, 0));
+    }
+
+    if (!pNext) {
+        labelNextUp->setText(tr("Queue empty"));
+        labelNextUp->setStyleSheet(QStringLiteral("color: #888888;"));
+        applyAiDjBadge(labelBpmMatch, QString(), QString());
+        applyAiDjBadge(labelKeyMatch, QString(), QString());
+        return;
+    }
+
+    labelNextUp->setStyleSheet(QStringLiteral("color: #b0b0b0;"));
+    labelNextUp->setText(tr("Next: %1").arg(pNext->getInfo()));
+
+    if (!pCurrent) {
+        // Nothing playing to compare against yet.
+        applyAiDjBadge(labelBpmMatch, QString(), QString());
+        applyAiDjBadge(labelKeyMatch, QString(), QString());
+        return;
+    }
+
+    // BPM match (respects half/double tempo).
+    const double currentBpm = pCurrent->getBpm();
+    const double nextBpm = pNext->getBpm();
+    const double maxBpmDelta = m_pConfig->getValue<double>(
+            ConfigKey(kPreferenceGroupName, kSmartQueueMaxBpmDeltaPreference), 6.0);
+    const double bpmDist =
+            mixxx::aidj::RulesTrackRanker::bpmDistance(currentBpm, nextBpm);
+    if (!mixxx::Bpm::isValidValue(currentBpm) ||
+            !mixxx::Bpm::isValidValue(nextBpm)) {
+        applyAiDjBadge(labelBpmMatch, tr("BPM ?"), QStringLiteral("muted"));
+    } else {
+        const QString bpmText = tr("BPM \u0394%1").arg(bpmDist, 0, 'f', 1);
+        const QString state = bpmDist <= maxBpmDelta
+                ? QStringLiteral("good")
+                : (bpmDist <= maxBpmDelta * 2 ? QStringLiteral("warn")
+                                              : QStringLiteral("bad"));
+        applyAiDjBadge(labelBpmMatch, bpmText, state);
+    }
+
+    // Harmonic key match.
+    const mixxx::track::io::key::ChromaticKey currentKey = pCurrent->getKey();
+    const mixxx::track::io::key::ChromaticKey nextKey = pNext->getKey();
+    if (currentKey == mixxx::track::io::key::INVALID ||
+            nextKey == mixxx::track::io::key::INVALID) {
+        applyAiDjBadge(labelKeyMatch, tr("Key ?"), QStringLiteral("muted"));
+    } else {
+        const QString keyName = KeyUtils::keyToString(nextKey);
+        const bool compatible =
+                mixxx::aidj::RulesTrackRanker::isKeyCompatible(currentKey, nextKey);
+        applyAiDjBadge(labelKeyMatch,
+                tr("Key %1").arg(keyName),
+                compatible ? QStringLiteral("good") : QStringLiteral("bad"));
+    }
 }
 
 void DlgAutoDJ::updateSelectionInfo() {

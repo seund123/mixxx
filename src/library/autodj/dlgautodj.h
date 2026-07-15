@@ -14,6 +14,7 @@ class WLibrary;
 class WTrackTableView;
 class Library;
 class KeyboardEventFilter;
+class QLabel;
 
 class DlgAutoDJ : public QWidget, public Ui::DlgAutoDJ, public LibraryView {
     Q_OBJECT
@@ -45,6 +46,9 @@ class DlgAutoDJ : public QWidget, public Ui::DlgAutoDJ, public LibraryView {
     void updateSelectionInfo();
     void slotTransitionModeChanged(int comboboxIndex);
     void slotRepeatPlaylistChanged(bool checked);
+    void slotSmartQueueChanged(bool checked);
+    void slotAutoSyncChanged(bool checked);
+    void updateAiDjStatus();
 
   signals:
     void addRandomTrackButton(bool buttonChecked);
@@ -64,6 +68,7 @@ class DlgAutoDJ : public QWidget, public Ui::DlgAutoDJ, public LibraryView {
             void (DlgAutoDJ::*pSlot)(bool),
             const QString& fallbackText);
     void keyPressEvent(QKeyEvent* pEvent) override;
+    void applyAiDjBadge(QLabel* pLabel, const QString& text, const QString& state);
 
     const UserSettingsPointer m_pConfig;
 
