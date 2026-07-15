@@ -69,6 +69,7 @@ class DlgAutoDJ : public QWidget, public Ui::DlgAutoDJ, public LibraryView {
             const QString& fallbackText);
     void keyPressEvent(QKeyEvent* pEvent) override;
     void applyAiDjBadge(QLabel* pLabel, const QString& text, const QString& state);
+    void applyModernStyling();
 
     const UserSettingsPointer m_pConfig;
 

@@ -280,8 +280,80 @@ DlgAutoDJ::DlgAutoDJ(WLibrary* parent,
             &DlgAutoDJ::autoDJStateChanged);
     autoDJStateChanged(m_pAutoDJProcessor->getState());
 
+    applyModernStyling();
+
     updateSelectionInfo();
     updateAiDjStatus();
+}
+
+void DlgAutoDJ::applyModernStyling() {
+    // Give the Auto DJ toolbar a modern, flat look with rounded controls and
+    // accent-colored active states. Selectors are scoped to this view's object
+    // names so the styling does not leak into the track table or other skins.
+    // Colors use rgba overlays so they adapt to light and dark skin backgrounds.
+    const QString style = QStringLiteral(
+            "#LibraryFeatureControls {"
+            "  background-color: rgba(127,127,127,0.06);"
+            "}"
+            "#LibraryFeatureControls QPushButton {"
+            "  padding: 5px 12px;"
+            "  border-radius: 7px;"
+            "  border: 1px solid rgba(127,127,127,0.28);"
+            "  background-color: rgba(127,127,127,0.10);"
+            "}"
+            "#LibraryFeatureControls QPushButton:hover {"
+            "  background-color: rgba(127,127,127,0.20);"
+            "  border-color: rgba(127,127,127,0.45);"
+            "}"
+            "#LibraryFeatureControls QPushButton:pressed {"
+            "  background-color: rgba(127,127,127,0.30);"
+            "}"
+            "#LibraryFeatureControls QPushButton:disabled {"
+            "  color: rgba(127,127,127,0.6);"
+            "  border-color: rgba(127,127,127,0.15);"
+            "  background-color: rgba(127,127,127,0.04);"
+            "}"
+            "#LibraryFeatureControls QPushButton:checked {"
+            "  background-color: rgba(90,140,255,0.32);"
+            "  border-color: rgba(90,140,255,0.75);"
+            "  color: #eef3ff;"
+            "}"
+            // Enable/disable button gets a distinct green "live" accent.
+            "#pushButtonAutoDJ:checked {"
+            "  background-color: rgba(74,181,94,0.34);"
+            "  border-color: rgba(74,181,94,0.85);"
+            "  color: #ecfff0;"
+            "}"
+            "#LibraryFeatureControls QComboBox,"
+            "#LibraryFeatureControls QSpinBox {"
+            "  padding: 4px 8px;"
+            "  border-radius: 7px;"
+            "  border: 1px solid rgba(127,127,127,0.28);"
+            "  background-color: rgba(127,127,127,0.10);"
+            "}"
+            "#LibraryFeatureControls QComboBox:hover,"
+            "#LibraryFeatureControls QSpinBox:hover {"
+            "  border-color: rgba(127,127,127,0.45);"
+            "}"
+            "#LibraryFeatureControls QComboBox::drop-down {"
+            "  border: none;"
+            "  width: 18px;"
+            "}"
+            "#aidjStatusBar {"
+            "  background-color: rgba(90,140,255,0.06);"
+            "  border-top: 1px solid rgba(127,127,127,0.18);"
+            "  border-bottom: 1px solid rgba(127,127,127,0.18);"
+            "}"
+            "#aidjStatusBar QLabel {"
+            "  font-size: 11px;"
+            "}");
+    setStyleSheet(style);
+
+    // Add breathing room around the toolbar controls.
+    if (horizontalLayout) {
+        horizontalLayout->setSpacing(6);
+        horizontalLayout->setContentsMargins(8, 6, 8, 6);
+    }
 }
 
 DlgAutoDJ::~DlgAutoDJ() {
