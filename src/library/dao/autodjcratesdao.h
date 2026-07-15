@@ -1,6 +1,8 @@
 #pragma once
 
+#include <QList>
 #include <QObject>
+#include <QPair>
 #include <QSqlDatabase>
 
 #include "library/trackset/crate/crateid.h"
@@ -25,6 +27,23 @@ class AutoDJCratesDAO : public QObject {
 
     // Get random track Id from library
     TrackId getRandomTrackIdFromLibrary(int iPlaylistId);
+
+    // Get candidate track IDs for Smart Queue selection, filtered directly in
+    // the database. Only tracks whose BPM falls inside one of the given ranges
+    // (OR'd together; empty means any BPM) and, if keyIds is non-empty, whose
+    // key_id is in that set are returned. Tracks in excludeTrackIds are omitted.
+    // When fromLibrary is true the whole library (minus the Auto DJ queue and
+    // filesystem-deleted tracks) is searched; otherwise only the active
+    // auto-DJ-crate tracks that are not already queued or loaded into a deck.
+    // Results are ordered by play count (favoring fresher tracks) then randomly,
+    // and capped at limit rows. The caller is expected to re-rank the result.
+    QList<TrackId> getSmartCandidateTrackIds(
+            bool fromLibrary,
+            int iPlaylistId,
+            const QList<QPair<double, double>>& bpmRanges,
+            const QList<int>& keyIds,
+            const QList<TrackId>& excludeTrackIds,
+            int limit);
 
   private:
     // Disallow copy and assign.

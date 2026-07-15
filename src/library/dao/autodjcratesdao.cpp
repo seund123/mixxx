@@ -2,6 +2,7 @@
 
 #include <QRandomGenerator>
 #include <QtDebug>
+#include <algorithm>
 
 #include "library/dao/trackschema.h"
 #include "library/queryutil.h"
@@ -1257,4 +1258,126 @@ TrackId AutoDJCratesDAO::getRandomTrackIdFromLibrary(int iPlaylistId) {
         qDebug() << "No random track available for Auto DJ in playlist" << iPlaylistId;
         return TrackId();
     }
+}
+
+QList<TrackId> AutoDJCratesDAO::getSmartCandidateTrackIds(
+        bool fromLibrary,
+        int iPlaylistId,
+        const QList<QPair<double, double>>& bpmRanges,
+        const QList<int>& keyIds,
+        const QList<TrackId>& excludeTrackIds,
+        int limit) {
+    // Make sure the temporary auto-DJ-crates database / active-tracks view
+    // exists before we query it.
+    createAndConnectAutoDjCratesDatabase();
+
+    QList<TrackId> result;
+    if (limit <= 0) {
+        return result;
+    }
+
+    // Build the optional filter conditions. All predicates reference the
+    // "library" table, which is present in both query variants below. Numeric
+    // values are formatted directly into the SQL; they never originate from
+    // user-entered text, so there is no injection risk.
+    QStringList conditions;
+
+    if (!bpmRanges.isEmpty()) {
+        QStringList bpmOrs;
+        for (const auto& range : bpmRanges) {
+            const double lo = std::max(0.0, range.first);
+            const double hi = std::max(lo, range.second);
+            bpmOrs << QStringLiteral("library.%1 BETWEEN %2 AND %3")
+                              .arg(LIBRARYTABLE_BPM,
+                                      QString::number(lo, 'f', 4),
+                                      QString::number(hi, 'f', 4));
+        }
+        conditions << (QStringLiteral("(") + bpmOrs.join(QStringLiteral(" OR ")) +
+                QStringLiteral(")"));
+    }
+
+    if (!keyIds.isEmpty()) {
+        QStringList keyStrs;
+        keyStrs.reserve(keyIds.size());
+        for (int keyId : keyIds) {
+            keyStrs << QString::number(keyId);
+        }
+        conditions << QStringLiteral("library.%1 IN (%2)")
+                              .arg(LIBRARYTABLE_KEY_ID,
+                                      keyStrs.join(QStringLiteral(",")));
+    }
+
+    if (!excludeTrackIds.isEmpty()) {
+        QStringList idStrs;
+        idStrs.reserve(excludeTrackIds.size());
+        for (const TrackId& trackId : excludeTrackIds) {
+            if (trackId.isValid()) {
+                idStrs << trackId.toString();
+            }
+        }
+        if (!idStrs.isEmpty()) {
+            conditions << QStringLiteral("library.%1 NOT IN (%2)")
+                                  .arg(LIBRARYTABLE_ID,
+                                          idStrs.join(QStringLiteral(",")));
+        }
+    }
+
+    const QString extraConditions = conditions.isEmpty()
+            ? QString()
+            : (QStringLiteral(" AND ") + conditions.join(QStringLiteral(" AND ")));
+
+    QSqlQuery oQuery(m_database);
+    QString strQuery;
+    if (fromLibrary) {
+        // Search the whole library, excluding the Auto DJ queue and
+        // filesystem-deleted / hidden tracks (mirrors getRandomTrackIdFromLibrary).
+        strQuery = QStringLiteral(
+                "SELECT library.%1 FROM " LIBRARY_TABLE
+                " WHERE library.%1 NOT IN ("
+                "   SELECT %2 FROM " PLAYLIST_TRACKS_TABLE
+                "   WHERE %3 = :playlistId)"
+                " AND library.location NOT IN ("
+                "   SELECT id FROM track_locations WHERE fs_deleted = 1)"
+                " AND library.%4 != 1"
+                "%5"
+                " ORDER BY library.%6, RANDOM() LIMIT :limit")
+                           .arg(LIBRARYTABLE_ID,             // %1
+                                   PLAYLISTTRACKSTABLE_TRACKID, // %2
+                                   PLAYLISTTRACKSTABLE_PLAYLISTID, // %3
+                                   LIBRARYTABLE_MIXXXDELETED,   // %4
+                                   extraConditions,             // %5
+                                   LIBRARYTABLE_TIMESPLAYED);   // %6
+    } else {
+        // Search only active auto-DJ-crate tracks that are not already queued
+        // or loaded into a deck (the active-tracks view already enforces this),
+        // joined to the library table for the BPM/key columns.
+        strQuery = QStringLiteral(
+                "SELECT " AUTODJACTIVETRACKS_TABLE "." AUTODJCRATESTABLE_TRACKID
+                " FROM " AUTODJACTIVETRACKS_TABLE
+                " INNER JOIN " LIBRARY_TABLE " ON library.%1 = "
+                AUTODJACTIVETRACKS_TABLE "." AUTODJCRATESTABLE_TRACKID
+                " WHERE 1=1%2"
+                " ORDER BY " AUTODJACTIVETRACKS_TABLE "." AUTODJCRATESTABLE_TIMESPLAYED
+                ", RANDOM() LIMIT :limit")
+                           .arg(LIBRARYTABLE_ID,   // %1
+                                   extraConditions); // %2
+    }
+
+    oQuery.prepare(strQuery);
+    if (fromLibrary) {
+        oQuery.bindValue(":playlistId", iPlaylistId);
+    }
+    oQuery.bindValue(":limit", limit);
+    if (!oQuery.exec()) {
+        LOG_FAILED_QUERY(oQuery);
+        return result;
+    }
+
+    while (oQuery.next()) {
+        TrackId trackId(oQuery.value(0));
+        if (trackId.isValid()) {
+            result.append(trackId);
+        }
+    }
+    return result;
 }

@@ -76,6 +76,10 @@ class AutoDJFeature : public LibraryFeature {
     /// BPM/key-aware selection when Smart Queue is enabled.
     TrackPointer retrieveSmartTrack();
 
+    /// Remember a track we just picked so Smart Queue avoids repeating it for
+    /// a while. Trims the history to the configured length.
+    void rememberPickedTrack(TrackId trackId);
+
     // The "Crates" tree-item under the "Auto DJ" tree-item.
     TreeItem* m_pCratesTreeItem;
 
@@ -86,6 +90,10 @@ class AutoDJFeature : public LibraryFeature {
 
     // How we access the auto-DJ-crates database.
     AutoDJCratesDAO m_autoDjCratesDao;
+
+    // Recently Smart-Queue-picked track IDs, most-recent last. Used to avoid
+    // re-picking the same tracks within a short window.
+    QList<TrackId> m_recentlyPickedTrackIds;
 
     parented_ptr<QAction> m_pEnableAutoDJAction;
     parented_ptr<QAction> m_pDisableAutoDJAction;

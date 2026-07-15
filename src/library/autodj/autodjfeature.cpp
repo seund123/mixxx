@@ -17,8 +17,11 @@
 #include "library/trackset/crate/cratestorage.h"
 #include "library/treeitem.h"
 #include "mixer/playerinfo.h"
+#include "mixer/playermanager.h"
 #include "moc_autodjfeature.cpp"
 #include "sources/soundsourceproxy.h"
+#include "track/bpm.h"
+#include "track/keyutils.h"
 #include "track/track.h"
 #include "util/clipboard.h"
 #include "util/defs.h"
@@ -28,13 +31,18 @@
 
 namespace {
 constexpr int kMaxRetrieveAttempts = 3;
-constexpr int kSmartQueueCandidateSampleSize = 24;
+// How many candidate tracks the DB pre-filter returns for the ranker to score.
+constexpr int kSmartQueueCandidateLimit = 150;
+// Default number of recently-picked tracks Smart Queue avoids repeating.
+constexpr int kSmartQueueRecentHistoryDefault = 20;
 
 const QString kAutoDjConfigGroup = QStringLiteral("[Auto DJ]");
 const QString kEnableSmartQueue = QStringLiteral("EnableSmartQueue");
 const QString kSmartQueueMaxBpmDelta = QStringLiteral("SmartQueueMaxBpmDelta");
 const QString kSmartQueueRequireCompatibleKey =
         QStringLiteral("SmartQueueRequireCompatibleKey");
+const QString kSmartQueueRecentHistory =
+        QStringLiteral("SmartQueueRecentHistory");
 
 int findOrCrateAutoDjPlaylistId(PlaylistDAO& playlistDAO) {
     int playlistId = playlistDAO.getPlaylistIdFromName(AUTODJ_TABLE);
@@ -404,65 +412,170 @@ TrackPointer AutoDJFeature::retrieveRandomTrack() {
 }
 
 TrackPointer AutoDJFeature::retrieveSmartTrack() {
-    QList<mixxx::aidj::RankerCandidate> candidates;
-    QSet<TrackId> seen;
-    candidates.reserve(kSmartQueueCandidateSampleSize);
+    const bool fromLibrary = m_crateList.isEmpty();
 
-    for (int attempt = 0;
-            attempt < kSmartQueueCandidateSampleSize * 2 &&
-            candidates.size() < kSmartQueueCandidateSampleSize;
-            ++attempt) {
-        TrackId trackId;
-        if (m_crateList.isEmpty()) {
-            trackId = m_autoDjCratesDao.getRandomTrackIdFromLibrary(
-                    m_iAutoDJPlaylistId);
-        } else {
-            trackId = m_autoDjCratesDao.getRandomTrackId();
-        }
-        if (!trackId.isValid() || seen.contains(trackId)) {
-            continue;
-        }
-        seen.insert(trackId);
-
-        TrackPointer pTrack =
-                m_pLibrary->trackCollectionManager()->getTrackById(trackId);
-        if (!pTrack || !trackFileExists(pTrack)) {
-            continue;
-        }
-
-        mixxx::aidj::RankerCandidate candidate;
-        candidate.trackId = trackId;
-        candidate.bpm = pTrack->getBpm();
-        candidate.key = pTrack->getKey();
-        candidates.append(candidate);
-    }
-
-    if (candidates.isEmpty()) {
-        return TrackPointer();
-    }
-
-    mixxx::aidj::MixingContext context;
-    context.maxBpmDelta = m_pConfig->getValue(
+    const double maxBpmDelta = m_pConfig->getValue(
             ConfigKey(kAutoDjConfigGroup, kSmartQueueMaxBpmDelta), 6.0);
-    context.requireCompatibleKey = m_pConfig->getValue(
+    const bool requireCompatibleKey = m_pConfig->getValue(
             ConfigKey(kAutoDjConfigGroup, kSmartQueueRequireCompatibleKey),
             false);
 
+    // The currently playing track is the reference: its BPM/key drive both the
+    // database pre-filter and the final ranking.
+    double referenceBpm = 0.0;
+    mixxx::track::io::key::ChromaticKey referenceKey =
+            mixxx::track::io::key::INVALID;
+    TrackId currentTrackId;
     const TrackPointer pCurrent = PlayerInfo::instance().getCurrentPlayingTrack();
     if (pCurrent) {
-        context.currentTrackId = pCurrent->getId();
-        context.currentBpm = pCurrent->getBpm();
-        context.currentKey = pCurrent->getKey();
-        context.excludeTrackIds.insert(pCurrent->getId());
+        currentTrackId = pCurrent->getId();
+        referenceBpm = pCurrent->getBpm();
+        referenceKey = pCurrent->getKey();
+    }
+
+    // Build BPM ranges (including half-/double-tempo) for the DB pre-filter.
+    // |ref - cand| <= d, |ref - 2*cand| <= d and |ref - cand/2| <= d map to the
+    // three candidate-BPM windows below.
+    QList<QPair<double, double>> bpmRanges;
+    if (mixxx::Bpm::isValidValue(referenceBpm)) {
+        const double lo = referenceBpm - maxBpmDelta;
+        const double hi = referenceBpm + maxBpmDelta;
+        bpmRanges.append(qMakePair(lo, hi));
+        bpmRanges.append(qMakePair(lo / 2.0, hi / 2.0));
+        bpmRanges.append(qMakePair(lo * 2.0, hi * 2.0));
+    }
+
+    // In strict mode, only fetch key-compatible candidates from the database.
+    QList<int> keyIds;
+    if (requireCompatibleKey && referenceKey != mixxx::track::io::key::INVALID) {
+        const QList<mixxx::track::io::key::ChromaticKey> compatible =
+                KeyUtils::getCompatibleKeys(referenceKey);
+        keyIds.reserve(compatible.size());
+        for (const auto key : compatible) {
+            keyIds.append(static_cast<int>(key));
+        }
+    }
+
+    // Base exclusions that always apply: the current track and everything
+    // loaded into a deck (we never want to queue a track that's already
+    // playing or cued up).
+    QList<TrackId> baseExcludeList;
+    QSet<TrackId> baseExcludeSet;
+    const auto addBaseExclusion = [&](TrackId id) {
+        if (id.isValid() && !baseExcludeSet.contains(id)) {
+            baseExcludeSet.insert(id);
+            baseExcludeList.append(id);
+        }
+    };
+    addBaseExclusion(currentTrackId);
+    const int numDecks = PlayerInfo::instance().numDecks();
+    for (int i = 0; i < numDecks; ++i) {
+        const TrackPointer pDeckTrack = PlayerInfo::instance().getTrackInfo(
+                PlayerManager::groupForDeck(i));
+        if (pDeckTrack) {
+            addBaseExclusion(pDeckTrack->getId());
+        }
+    }
+
+    // Recency exclusions layer on top of the base set to keep the queue moving
+    // forward instead of looping the same tracks.
+    QList<TrackId> recentExcludeList = baseExcludeList;
+    QSet<TrackId> recentExcludeSet = baseExcludeSet;
+    for (const TrackId& id : m_recentlyPickedTrackIds) {
+        if (id.isValid() && !recentExcludeSet.contains(id)) {
+            recentExcludeSet.insert(id);
+            recentExcludeList.append(id);
+        }
     }
 
     const mixxx::aidj::RulesTrackRanker ranker;
-    const QList<TrackId> ranked = ranker.rank(context, candidates);
-    if (ranked.isEmpty()) {
-        return TrackPointer();
+
+    // Run a single selection attempt with the given hard BPM pre-filter and
+    // exclusion set, returning the top-ranked track or null if nothing matched.
+    // The DB pre-filter is only an optimization: the ranker still applies the
+    // soft BPM/key preferences (and the same exclusions) to whatever it gets.
+    const auto runAttempt =
+            [&](const QList<QPair<double, double>>& ranges,
+                    const QList<TrackId>& excludeList,
+                    const QSet<TrackId>& excludeSet) -> TrackPointer {
+        const QList<TrackId> candidateIds =
+                m_autoDjCratesDao.getSmartCandidateTrackIds(
+                        fromLibrary,
+                        m_iAutoDJPlaylistId,
+                        ranges,
+                        keyIds,
+                        excludeList,
+                        kSmartQueueCandidateLimit);
+
+        QList<mixxx::aidj::RankerCandidate> candidates;
+        candidates.reserve(candidateIds.size());
+        for (const TrackId& trackId : candidateIds) {
+            const TrackPointer pTrack =
+                    m_pLibrary->trackCollectionManager()->getTrackById(trackId);
+            if (!pTrack || !trackFileExists(pTrack)) {
+                continue;
+            }
+            mixxx::aidj::RankerCandidate candidate;
+            candidate.trackId = trackId;
+            candidate.bpm = pTrack->getBpm();
+            candidate.key = pTrack->getKey();
+            candidates.append(candidate);
+        }
+        if (candidates.isEmpty()) {
+            return TrackPointer();
+        }
+
+        mixxx::aidj::MixingContext context;
+        context.maxBpmDelta = maxBpmDelta;
+        context.requireCompatibleKey = requireCompatibleKey;
+        context.currentTrackId = currentTrackId;
+        context.currentBpm = referenceBpm;
+        context.currentKey = referenceKey;
+        context.excludeTrackIds = excludeSet;
+
+        const QList<TrackId> ranked = ranker.rank(context, candidates);
+        if (ranked.isEmpty()) {
+            return TrackPointer();
+        }
+        return m_pLibrary->trackCollectionManager()->getTrackById(ranked.first());
+    };
+
+    // Tiered fallback so a narrow pre-filter never stalls the queue:
+    //   1) BPM window + full recency (the ideal pick),
+    //   2) BPM window but ignore recency (small libraries),
+    //   3) drop the hard BPM filter entirely and let the ranker demote
+    //      out-of-window / unknown-BPM tracks as designed.
+    // The compatible-key filter (strict mode) is kept in every tier, so the
+    // "require compatible key" contract is never violated.
+    TrackPointer pPicked = runAttempt(bpmRanges, recentExcludeList, recentExcludeSet);
+    if (!pPicked) {
+        pPicked = runAttempt(bpmRanges, baseExcludeList, baseExcludeSet);
+    }
+    if (!pPicked && !bpmRanges.isEmpty()) {
+        pPicked = runAttempt(
+                QList<QPair<double, double>>(), baseExcludeList, baseExcludeSet);
     }
 
-    return m_pLibrary->trackCollectionManager()->getTrackById(ranked.first());
+    if (pPicked) {
+        rememberPickedTrack(pPicked->getId());
+    }
+    return pPicked;
+}
+
+void AutoDJFeature::rememberPickedTrack(TrackId trackId) {
+    if (!trackId.isValid()) {
+        return;
+    }
+    const int historySize = qMax(0,
+            m_pConfig->getValue(
+                    ConfigKey(kAutoDjConfigGroup, kSmartQueueRecentHistory),
+                    kSmartQueueRecentHistoryDefault));
+    // Move the track to the most-recent end.
+    m_recentlyPickedTrackIds.removeAll(trackId);
+    m_recentlyPickedTrackIds.append(trackId);
+    while (m_recentlyPickedTrackIds.size() > historySize) {
+        m_recentlyPickedTrackIds.removeFirst();
+    }
 }
 
 void AutoDJFeature::constructCrateChildModel() {
