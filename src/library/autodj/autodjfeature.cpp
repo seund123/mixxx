@@ -3,6 +3,7 @@
 #include <QMenu>
 #include <QSet>
 #include <QtDebug>
+#include <utility>
 
 #include "controllers/keyboard/keyboardeventfilter.h"
 #include "library/aidj/mixingcontext.h"
@@ -481,7 +482,7 @@ TrackPointer AutoDJFeature::retrieveSmartTrack() {
     // forward instead of looping the same tracks.
     QList<TrackId> recentExcludeList = baseExcludeList;
     QSet<TrackId> recentExcludeSet = baseExcludeSet;
-    for (const TrackId& id : m_recentlyPickedTrackIds) {
+    for (const TrackId& id : std::as_const(m_recentlyPickedTrackIds)) {
         if (id.isValid() && !recentExcludeSet.contains(id)) {
             recentExcludeSet.insert(id);
             recentExcludeList.append(id);
