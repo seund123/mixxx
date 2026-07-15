@@ -1,5 +1,6 @@
 #include "library/autodj/autodjprocessor.h"
 
+#include "effects/chains/equalizereffectchain.h"
 #include "engine/channels/enginedeck.h"
 #include "library/aidj/transitionplanner.h"
 #include "mixer/basetrackplayer.h"
@@ -44,6 +45,14 @@ DeckAttributes::DeckAttributes(int index,
           m_rateRatio(group, "rate_ratio"),
           m_syncEnabled(group, "sync_enabled"),
           m_keylock(group, "keylock"),
+          m_eqLow(EqualizerEffectChain::formatEffectSlotGroup(group),
+                  QStringLiteral("parameter1")),
+          m_syncControlledByAutoDj(false),
+          m_syncPreviousValue(0.0),
+          m_keylockControlledByAutoDj(false),
+          m_keylockPreviousValue(0.0),
+          m_bassCutByAutoDj(false),
+          m_bassPreviousValue(1.0),
           m_pPlayer(pPlayer) {
     connect(m_pPlayer, &BaseTrackPlayer::newTrackLoaded,
             this, &DeckAttributes::slotTrackLoaded);
@@ -111,10 +120,54 @@ TrackPointer DeckAttributes::getLoadedTrack() const {
 
 void DeckAttributes::applyTransitionPlan(const mixxx::aidj::TransitionPlan& plan) {
     if (plan.enableSync) {
+        if (!m_syncControlledByAutoDj) {
+            m_syncPreviousValue = m_syncEnabled.get();
+            m_syncControlledByAutoDj = true;
+        }
         m_syncEnabled.set(1.0);
     }
     if (plan.enableKeylock) {
+        if (!m_keylockControlledByAutoDj) {
+            m_keylockPreviousValue = m_keylock.get();
+            m_keylockControlledByAutoDj = true;
+        }
         m_keylock.set(1.0);
+    }
+}
+
+void DeckAttributes::restoreTransitionControls() {
+    // Note: this reverts sync/keylock to their pre-Auto-DJ values even if the
+    // user toggled them manually while Auto DJ was running. Reverting sync on a
+    // still-playing deck can cause an audible tempo snap; this is an accepted
+    // tradeoff to avoid leaving controls stuck on after Auto DJ stops.
+    if (m_syncControlledByAutoDj) {
+        m_syncEnabled.set(m_syncPreviousValue);
+        m_syncControlledByAutoDj = false;
+    }
+    if (m_keylockControlledByAutoDj) {
+        m_keylock.set(m_keylockPreviousValue);
+        m_keylockControlledByAutoDj = false;
+    }
+    restoreBass();
+}
+
+void DeckAttributes::cutBassForTransition() {
+    // Guard against a missing EQ control: capturing get()==0.0 as the "previous"
+    // value would otherwise leave the bass permanently killed on restore.
+    if (!m_eqLow.valid()) {
+        return;
+    }
+    if (!m_bassCutByAutoDj) {
+        m_bassPreviousValue = m_eqLow.get();
+        m_bassCutByAutoDj = true;
+    }
+    m_eqLow.set(0.0);
+}
+
+void DeckAttributes::restoreBass() {
+    if (m_bassCutByAutoDj) {
+        m_eqLow.set(m_bassPreviousValue);
+        m_bassCutByAutoDj = false;
     }
 }
 
@@ -591,6 +644,9 @@ AutoDJProcessor::AutoDJError AutoDJProcessor::toggleAutoDJ(bool enable) {
                 this,
                 &AutoDJProcessor::crossfaderChanged);
         for (const auto& pDeck : m_decks) {
+            // Undo any sync / keylock / bass changes Auto DJ made so the decks
+            // are left in the state the user had before enabling Auto DJ.
+            pDeck->restoreTransitionControls();
             pDeck->disconnect(this);
         }
         if (m_pConfig->getValue<bool>(ConfigKey(kPreferenceGroup,
@@ -774,6 +830,10 @@ void AutoDJProcessor::playerPositionChanged(DeckAttributes* pAttributes,
             thisDeck->fadeBeginPos = 1.0;
             thisDeck->fadeEndPos = 1.0;
             otherDeck->isFromDeck = false;
+            // The transition was aborted; make sure neither deck is left with
+            // its bass cut.
+            thisDeck->restoreBass();
+            otherDeck->restoreBass();
             // Load the next track to otherDeck.
             loadNextTrackFromQueue(*otherDeck);
             emitAutoDJStateChanged(m_eState);
@@ -813,6 +873,12 @@ void AutoDJProcessor::playerPositionChanged(DeckAttributes* pAttributes,
                 // Arm sync/keylock while still IDLE so rate_ratio updates can
                 // influence fade math via playerRateChanged before we enter FADING.
                 prepareToDeckForTransition(otherDeck);
+
+                if (isBassSwapEnabled()) {
+                    // Cut the incoming deck's bass so the two basslines don't
+                    // clash; it is swapped back in at the transition midpoint.
+                    otherDeck->cutBassForTransition();
+                }
 
                 // Set the state as FADING.
                 m_eState = thisDeck->isLeft() ? ADJ_LEFT_FADING : ADJ_RIGHT_FADING;
@@ -871,6 +937,11 @@ void AutoDJProcessor::playerPositionChanged(DeckAttributes* pAttributes,
             // P1/P2FADING case above).
             thisDeck->stop();
             m_transitionProgress = 1.0;
+            // Restore bass on both decks: the faded-out deck (so a future track
+            // there is not silent) and the incoming deck in case a very short
+            // fade skipped the midpoint swap below.
+            thisDeck->restoreBass();
+            otherDeck->restoreBass();
             // Note: If the user has stopped the toDeck during the transition.
             // this deck just stops as well. In this case a stopped AutoDJ is accepted
             // because the use did it intentionally
@@ -892,6 +963,13 @@ void AutoDJProcessor::playerPositionChanged(DeckAttributes* pAttributes,
                 // we move the crossfader linearly with
                 // movements in this track's play position.
                 setCrossfader(currentCrossfader + adjustment);
+            }
+            // Bass swap at the midpoint: bring the incoming deck's bass back
+            // and cut the outgoing (fading) deck's bass.
+            if (isBassSwapEnabled() &&
+                    m_transitionProgress < 0.5 && transitionProgress >= 0.5) {
+                otherDeck->restoreBass();
+                thisDeck->cutBassForTransition();
             }
             m_transitionProgress = transitionProgress;
             // if we are at 1.0 here, we need an additional callback until the last
@@ -1569,6 +1647,12 @@ void AutoDJProcessor::prepareToDeckForTransition(DeckAttributes* pToDeck) {
                  << "keylock" << plan.enableKeylock;
     }
     pToDeck->applyTransitionPlan(plan);
+}
+
+bool AutoDJProcessor::isBassSwapEnabled() const {
+    return m_pConfig->getValue(
+            ConfigKey(kPreferenceGroup, QStringLiteral("AutoBassSwapOnTransition")),
+            false);
 }
 
 void AutoDJProcessor::useFixedFadeTime(

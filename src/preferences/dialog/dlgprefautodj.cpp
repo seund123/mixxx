@@ -112,6 +112,8 @@ void DlgPrefAutoDJ::slotUpdate() {
             ConfigKey("[Auto DJ]", "AutoSyncOnTransition"), false));
     AutoKeylockOnTransitionCheckBox->setChecked(m_pConfig->getValue(
             ConfigKey("[Auto DJ]", "AutoKeylockOnTransition"), false));
+    AutoBassSwapOnTransitionCheckBox->setChecked(m_pConfig->getValue(
+            ConfigKey("[Auto DJ]", "AutoBassSwapOnTransition"), false));
     slotToggleSmartQueue(
             SmartQueueCheckBox->isChecked() ? Qt::Checked : Qt::Unchecked);
     slotToggleAutoSyncOnTransition(
@@ -148,6 +150,8 @@ void DlgPrefAutoDJ::slotApply() {
             AutoSyncOnTransitionCheckBox->isChecked());
     m_pConfig->setValue(ConfigKey("[Auto DJ]", "AutoKeylockOnTransition"),
             AutoKeylockOnTransitionCheckBox->isChecked());
+    m_pConfig->setValue(ConfigKey("[Auto DJ]", "AutoBassSwapOnTransition"),
+            AutoBassSwapOnTransitionCheckBox->isChecked());
 }
 
 void DlgPrefAutoDJ::slotResetToDefaults() {
@@ -173,6 +177,7 @@ void DlgPrefAutoDJ::slotResetToDefaults() {
     AutoSyncOnTransitionCheckBox->setChecked(false);
     AutoKeylockOnTransitionCheckBox->setChecked(false);
     AutoKeylockOnTransitionCheckBox->setEnabled(false);
+    AutoBassSwapOnTransitionCheckBox->setChecked(false);
 }
 
 #if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0)

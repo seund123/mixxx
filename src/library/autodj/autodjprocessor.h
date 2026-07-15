@@ -95,8 +95,18 @@ class DeckAttributes : public QObject {
 
     TrackPointer getLoadedTrack() const;
 
-    /// Apply a beatmatched-transition plan to this deck (sync / keylock).
+    /// Apply a beatmatched-transition plan to this deck (sync / keylock),
+    /// remembering the pre-existing control values so they can be restored.
     void applyTransitionPlan(const mixxx::aidj::TransitionPlan& plan);
+
+    /// Restore sync / keylock (and bass) to whatever they were before Auto DJ
+    /// changed them. Safe to call even if nothing was changed.
+    void restoreTransitionControls();
+
+    /// Cut this deck's bass (low EQ) for a "bass swap" transition, remembering
+    /// the previous value. restoreBass() puts it back.
+    void cutBassForTransition();
+    void restoreBass();
 
   signals:
     void playChanged(DeckAttributes* pDeck, bool playing);
@@ -145,6 +155,14 @@ class DeckAttributes : public QObject {
     ControlProxy m_rateRatio;
     ControlProxy m_syncEnabled;
     ControlProxy m_keylock;
+    ControlProxy m_eqLow;
+    // Remember control values Auto DJ overrode so we can restore them.
+    bool m_syncControlledByAutoDj;
+    double m_syncPreviousValue;
+    bool m_keylockControlledByAutoDj;
+    double m_keylockPreviousValue;
+    bool m_bassCutByAutoDj;
+    double m_bassPreviousValue;
     BaseTrackPlayer* m_pPlayer;
 };
 
@@ -291,6 +309,8 @@ class AutoDJProcessor : public QObject {
             double toDeckStartSecond);
     /// Read Smart/beatmatch transition prefs and apply them to the to-deck.
     void prepareToDeckForTransition(DeckAttributes* pToDeck);
+    /// Whether the "swap bass during transitions" preference is enabled.
+    bool isBassSwapEnabled() const;
     DeckAttributes* getLeftDeck();
     DeckAttributes* getRightDeck();
     DeckAttributes* getOtherDeck(const DeckAttributes* pThisDeck);
